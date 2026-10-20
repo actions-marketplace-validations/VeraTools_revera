@@ -30,6 +30,8 @@
   let config = $state<ConfigDocument>();
   let name = $state('revera');
   let org = $state('');
+  let publicApp = $state('false');
+  let publishFixes = $state(false);
   let installUrl = $state('');
   let error = $state('');
   let busy = $state('');
@@ -50,9 +52,17 @@
   const retrievalOn = $derived(
     config?.has(['vera']) ? config.get(['vera', 'enabled'], true) : false,
   );
-  const tested = $derived(
-    !!config && config.yaml === testedYaml && tests.investigator?.ok && tests.validator?.ok,
+  const embeddingRequired = $derived(
+    retrievalOn && config?.get(['vera', 'backend'], 'local') === 'api',
   );
+  const testsCurrent = $derived(!!config && config.yaml === testedYaml);
+  const tested = $derived(
+    testsCurrent &&
+      tests.investigator?.ok &&
+      tests.validator?.ok &&
+      (!embeddingRequired || tests.embedding?.ok),
+  );
+  const testRoles: Role[] = ['investigator', 'validator', 'embedding'];
   async function load() {
     try {
       session = await api.session();
@@ -98,7 +108,11 @@
   async function checkSetup() {
     busy = 'session';
     try {
+      if (session?.authenticated && session.setup.stage === 'install')
+        await api.reconcileInstallations();
       await load();
+    } catch (cause) {
+      error = errorMessage(cause);
     } finally {
       busy = '';
     }
@@ -116,7 +130,13 @@
     busy = 'create';
     error = '';
     try {
-      const result = await api.manifest(setupToken, name, org.trim());
+      const result = await api.manifest(
+        setupToken,
+        name,
+        org.trim(),
+        publicApp === 'true',
+        publishFixes,
+      );
       if (mockMode) {
         const { setMockStage } = await import('#lib/mock');
         setMockStage('sign_in');
@@ -214,20 +234,21 @@
     error = '';
     message = '';
     tests = {};
+    const yaml = config.yaml;
+    const testEmbedding = embeddingRequired;
     try {
-      await api.saveConfig(config.yaml);
+      await api.saveConfig(yaml);
       tests.investigator = await api.test('investigator');
       tests.validator = await api.test('validator');
-      if (retrievalOn && config.get(['vera', 'backend'], 'local') === 'api')
-        tests.embedding = await api.test('embedding');
-      testedYaml = config.yaml;
+      if (testEmbedding) tests.embedding = await api.test('embedding');
+      testedYaml = yaml;
       if (!tests.investigator.ok || !tests.validator.ok || tests.embedding?.ok === false)
         error =
           tests.investigator.error ||
           tests.validator.error ||
           tests.embedding?.error ||
           'A connection failed. Check the endpoint, model, and key.';
-      else message = 'Both review models are connected.';
+      else message = 'All tested connections are working.';
     } catch (cause) {
       error = errorMessage(cause);
     } finally {
@@ -315,19 +336,50 @@
               placeholder="Your GitHub organization"
             /><small>Leave blank to create the app under your personal account.</small>
           </div>
+          <div class="field">
+            <label for="app-installability">Who can install this app?</label>
+            <SelectField
+              id="app-installability"
+              bind:value={publicApp}
+              options={[
+                { value: 'false', label: 'Only this account' },
+                { value: 'true', label: 'Any account or organization' },
+              ]}
+            />
+            <small
+              >Public installability is not access to this deployment. Each additional owner still
+              needs a Revera administrator’s approval. GitHub organization rules also control who
+              can install apps.</small
+            >
+          </div>
+          <div class="field">
+            <label
+              ><input type="checkbox" bind:checked={publishFixes} /> Allow Revera to publish approved
+              fixes</label
+            >
+            <small
+              >Requests Contents write instead of read. This does not enable fix execution or
+              authorize a write; patch-only fixes need no write permission.</small
+            >
+          </div>
           <button type="submit" class="button primary setup-submit" disabled={!!busy}
             >{busy ? 'Preparing…' : 'Create GitHub App'}<ArrowUpRight size={15} /></button
           >
         </form>
         <div class="setup-permissions">
-          <div><FolderGit2 size={15} />Read repository contents</div>
+          <div>
+            <FolderGit2 size={15} />{publishFixes
+              ? 'Write repository contents for approved fixes'
+              : 'Read repository contents'}
+          </div>
           <div><GitPullRequest size={15} />Post pull request reviews and checks</div>
           <div><MessageCircle size={15} />Reply to @mentions in pull request comments</div>
           <div><ShieldCheck size={15} />Only repositories you choose during installation</div>
         </div>
       </section>
       <p class="setup-note">
-        The app is private. Your code stays between your server and the endpoints you configure.
+        The dashboard stays administrator-only, regardless of who can install the app. Your code
+        stays between your server and the endpoints you configure.
       </p>
     {:else if step === 1}<section class="setup-panel">
         <h1>Sign in with GitHub</h1>
@@ -362,6 +414,9 @@
             rel="noreferrer">Install on repositories<ArrowUpRight size={15} /></a
           >{/if}
         <div class="polling"><Status status="running" label="Waiting for installation" /></div>
+        <button class="button small" disabled={!!busy} onclick={checkSetup}
+          >Refresh installation status</button
+        >
         <p class="helper" style="margin-top: 24px">
           Keep this page open. It will continue when GitHub confirms the installation. Existing pull
           requests are not automatically reviewed.
@@ -453,15 +508,37 @@
           <button class="button" onclick={test} disabled={!!busy}
             >{busy === 'test' ? 'Testing…' : 'Test connections'}</button
           >
-          {#if tested}<Status status="complete" label="Connected" />{/if}
+          {#if testsCurrent}
+            {#each testRoles as role}
+              {#if tests[role]}
+                <span title={tests[role]?.error}>
+                  <Status
+                    status={tests[role]?.ok ? 'complete' : 'failed'}
+                    label={`${role}: ${tests[role]?.ok ? 'Connected' : 'Failed'}`}
+                  />
+                </span>
+              {/if}
+            {/each}
+          {/if}
         </div>
-        <button
-          class="button primary setup-submit"
-          disabled={!!busy || !tested || tests.embedding?.ok === false}
-          onclick={finish}>Finish setup</button
+        {#if testsCurrent && tests.embedding?.ok === false}
+          <p class="helper">
+            Embedding connection failed. Check the endpoint, key, and model. The endpoint must
+            support embeddings, and the model must be an embedding model, not a reranker. You can
+            turn off Use Vera retrieval under Repository search, then test again to continue without
+            semantic search.
+          </p>
+        {/if}
+        <button class="button primary setup-submit" disabled={!!busy || !tested} onclick={finish}
+          >Finish setup</button
         >
         <p class="helper" style="margin-top: 12px">
           Testing saves this configuration. You can change all model settings later.
+        </p>
+        <p class="helper">
+          Need to repair an existing configuration? <a class="text-link" href="/settings"
+            >Open settings</a
+          >.
         </p>
       </section>
       <p class="setup-note">API keys are stored on your server and never shown again.</p>

@@ -1,11 +1,13 @@
 <script lang="ts">
   import '../app.css';
+  import { onMount } from 'svelte';
   import { page } from '$app/state';
   import { goto, afterNavigate } from '$app/navigation';
   import { DropdownMenu } from 'bits-ui';
   import {
     LayoutDashboard,
     GitPullRequest,
+    Wrench,
     FolderGit2,
     Settings,
     ChevronDown,
@@ -29,6 +31,21 @@
   let error = $state('');
   let appName = $state('Revera');
   let collapsed = $state(false);
+  onMount(() => {
+    try {
+      collapsed = localStorage.getItem('revera-sidebar') === 'collapsed';
+    } catch {
+      /* Storage may be disabled. */
+    }
+  });
+  function toggleSidebar() {
+    collapsed = !collapsed;
+    try {
+      localStorage.setItem('revera-sidebar', collapsed ? 'collapsed' : 'expanded');
+    } catch {
+      /* Storage may be disabled. */
+    }
+  }
   const themes = [
     { value: 'system', label: 'System', icon: Monitor },
     { value: 'light', label: 'Light', icon: Sun },
@@ -38,6 +55,7 @@
   const nav = [
     { href: '/', name: 'Overview', icon: LayoutDashboard },
     { href: '/reviews', name: 'Reviews', icon: GitPullRequest },
+    { href: '/fixes', name: 'Fixes', icon: Wrench },
     { href: '/repositories', name: 'Repositories', icon: FolderGit2 },
     { href: '/settings', name: 'Settings', icon: Settings },
   ];
@@ -50,7 +68,11 @@
     try {
       session = await api.session();
       error = '';
-      if (!isSetup && session.setup.stage !== 'done') await goto('/setup');
+      const settingsRecovery =
+        page.url.pathname === '/settings' &&
+        session.authenticated &&
+        session.setup.stage === 'configure';
+      if (!isSetup && session.setup.stage !== 'done' && !settingsRecovery) await goto('/setup');
       if (session.authenticated) appName = (await api.overview()).app.name;
     } catch (cause) {
       error = errorMessage(cause);
@@ -116,7 +138,7 @@
       <div class="sidebar-bottom">
         <button
           class="sidebar-collapse"
-          onclick={() => (collapsed = !collapsed)}
+          onclick={toggleSidebar}
           aria-label={collapsed ? 'Expand navigation' : 'Collapse navigation'}
           >{#if collapsed}<PanelLeftOpen size={17} />{:else}<PanelLeftClose size={17} /><span
               class="sidebar-label">Collapse sidebar</span

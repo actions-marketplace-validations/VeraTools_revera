@@ -58,6 +58,13 @@ Revera reviews. Findings are posted inline when they sit on diff lines;
 other accepted findings go in the managed summary. Later pushes update the
 same review state without duplicating still-open findings.
 
+A complete review with accepted or carried findings also has a collapsed **Fix with
+your coding agent** section in its summary. Small, exact replacements may
+appear as GitHub suggested changes; neither is a tested patch. See
+[instructions and suggestions](how-it-works.md#instructions-for-a-coding-agent).
+Carried findings remain available after later pushes or identical-content
+reruns, without being counted as newly accepted or posted inline again.
+
 ## Inputs
 
 Set inputs under `with:` on the `VeraTools/revera` step. Pass provider keys
@@ -83,8 +90,11 @@ with:
   fail-on: partial
 ```
 
-Profiles do not disable validation. [Profile settings](configuration.md#profiles)
-and [strategy behavior](how-it-works.md#strategies) are separate.
+Built-in Quick and Deep scale from your configured budget without changing
+validation or strategy. A custom profile named `quick` or `deep` replaces that
+built-in; other custom names leave both built-ins available. See
+[profile settings](configuration.md#profiles) and
+[strategy behavior](how-it-works.md#strategies).
 
 ## Outputs and exit codes
 

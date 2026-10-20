@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { relative, duration } from '#lib/time';
+  import { relative, duration, severitySplit } from '#lib/time';
   import type { JobSummary } from '#lib/types';
   import Status from './Status.svelte';
+  import ExternalBadge from './ExternalBadge.svelte';
   let { jobs }: { jobs: JobSummary[] } = $props();
 </script>
 
@@ -20,19 +21,23 @@
           <td
             ><a class="row-title" href={`/reviews/${job.id}`}>{job.title || 'Repository index'}</a>
             <div class="row-meta">
+              <ExternalBadge source={job.source} />
               <span>{job.repo}</span><span class="meta-separator">·</span><span
                 >{job.kind === 'index' ? 'Index' : `#${job.pr}`}</span
               >{#if job.author}<span class="meta-separator">·</span><span>{job.author}</span>{/if}
               {#if job.kind === 'review'}<span>·</span><span class="review-kind"
                   >{job.mode} · {job.trigger}</span
                 >{/if}
+              {#if job.source === 'external' && job.head_sha}<code title="Reviewed head"
+                  >{job.head_sha.slice(0, 7)}</code
+                >{/if}
             </div></td
           >
           <td><Status status={job.status} /></td>
           <td
-            >{#if job.findings.total}<span class="finding-count">{job.findings.total}</span
-              >{:else}<span class="muted"
-                >{['queued', 'running'].includes(job.status) ? '—' : '0'}</span
+            >{#if job.findings.total}<span class="finding-count">{job.findings.total}</span>
+              <div class="row-meta nowrap">{severitySplit(job.findings)}</div>{:else}<span
+                class="muted">{['queued', 'running'].includes(job.status) ? '—' : '0'}</span
               >{/if}</td
           >
           <td class="muted tabular">{duration(job.duration_ms)}</td>

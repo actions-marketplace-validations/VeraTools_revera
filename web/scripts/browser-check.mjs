@@ -4,10 +4,12 @@ import assert from 'node:assert/strict';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { checkFixes, fixScreenshots } from './browser-fixes.mjs';
+import { checkReviewRegressions } from './browser-review-regressions.mjs';
 
 const base = process.env.REVERA_WEB_URL || 'http://127.0.0.1:5173';
 const emptyYaml = process.argv.includes('--empty-yaml');
-const output = join(homedir(), '.local/tmp/revera-server/shots');
+const output = process.env.REVERA_WEB_OUTPUT || join(homedir(), '.local/tmp/revera-server/shots');
 await mkdir(output, { recursive: true });
 const browser = await chromium.launch({
   executablePath:
@@ -23,7 +25,22 @@ async function open(path, scheme = 'light', viewport = { width: 1440, height: 90
     reducedMotion: 'reduce',
   });
   const page = await context.newPage();
+  await page.addInitScript(() => {
+    // Reuse the app's module instance, including Vite's HMR timestamp. Importing
+    // the unversioned URL can create a second mock state and miss observed calls.
+    window.importDashboard = (path) => {
+      const loaded = performance
+        .getEntriesByType('resource')
+        .map((entry) => entry.name)
+        .findLast((name) => new URL(name).pathname === path);
+      return import(loaded || path);
+    };
+  });
   page.on('pageerror', (error) => errors.push(error.message));
+  page.on('console', (message) => {
+    if (message.type() === 'error' && message.text().startsWith('Svelte error:'))
+      errors.push(message.text());
+  });
   await page.goto(`${base}${path}`);
   await page.waitForFunction(() => !document.body.innerText.includes('Loading '));
   return { context, page };
@@ -32,7 +49,7 @@ async function shot(path, filename, scheme, ready, action) {
   const { context, page } = await open(path, scheme);
   await page.getByRole('heading', { name: ready, exact: true }).waitFor();
   await action?.(page);
-  await page.screenshot({ path: join(output, filename) });
+  await page.screenshot({ path: join(output, filename), fullPage: path.startsWith('/reviews/') });
   await context.close();
 }
 
@@ -100,7 +117,7 @@ async function checkSetupLink() {
   // Simulate the server recognizing the setup cookie in this browser.
   await page.evaluate(async () => {
     const path = '/src/lib/mock.ts';
-    const { setMockStage } = await import(path);
+    const { setMockStage } = await window.importDashboard(path);
     setMockStage('create_app', true);
   });
   await page.getByRole('button', { name: 'Check again', exact: true }).click();
@@ -132,7 +149,7 @@ async function choose(page, label, option) {
 async function savedConfig(page) {
   const yaml = await page.evaluate(async () => {
     const path = '/src/lib/api.ts';
-    const { api } = await import(path);
+    const { api } = await window.importDashboard(path);
     return (await api.settings()).yaml;
   });
   const doc = parseDocument(yaml);
@@ -144,7 +161,7 @@ async function testWizard(page) {
   // Observe calls without replacing the mock's real save/test behavior.
   await page.evaluate(async () => {
     const path = '/src/lib/api.ts';
-    const { api } = await import(path);
+    const { api } = await window.importDashboard(path);
     if (!window.testedRoles) {
       const test = api.test;
       api.test = (role) => {
@@ -167,6 +184,86 @@ async function testWizard(page) {
     'embedding',
   ]);
   return savedConfig(page);
+}
+
+async function checkSetupRecovery() {
+  const { context, page } = await open('/setup?stage=configure');
+  await page.getByRole('heading', { name: 'Connect your review models', exact: true }).waitFor();
+  await page.locator('summary').filter({ hasText: 'Repository search' }).click();
+  const retrieval = page.getByLabel('Enable Vera retrieval', { exact: true });
+  if ((await retrieval.getAttribute('aria-checked')) === 'false') await retrieval.click();
+  await choose(page, 'Embedding backend', 'API endpoint');
+  await edit(page, 'model-embedding-endpoint', 'https://api.example.com/v1');
+  await edit(page, 'model-embedding-name', 'incorrect-embedding-model');
+  await page.getByLabel('Enable reranker', { exact: true }).click();
+  await page.evaluate(async () => {
+    const { api } = await window.importDashboard('/src/lib/api.ts');
+    const { setMockStage } = await window.importDashboard('/src/lib/mock.ts');
+    const test = api.test;
+    window.testedRoles = [];
+    window.failEmbedding = true;
+    api.test = async (role) => {
+      window.testedRoles.push(role);
+      const result =
+        role === 'embedding' && window.failEmbedding
+          ? { ok: false, error: 'model request failed: embedding probe: HTTP 400' }
+          : await test(role);
+      // The real server does not complete setup while an enabled role fails.
+      if (window.failEmbedding) setMockStage('configure');
+      return result;
+    };
+  });
+  await page.getByRole('button', { name: 'Test connections', exact: true }).click();
+  await page.getByText('Embedding: Failed', { exact: true }).waitFor();
+  for (const label of ['Investigator: Connected', 'Validator: Connected'])
+    await page.getByText(label, { exact: true }).waitFor();
+  assert.equal(await page.getByText('Connected', { exact: true }).count(), 0);
+  assert.equal(await page.getByRole('button', { name: 'Finish setup' }).isEnabled(), false);
+  assert.ok((await page.locator('body').innerText()).includes('not a reranker'));
+  assert.deepEqual(await page.evaluate(() => window.testedRoles), [
+    'investigator',
+    'validator',
+    'embedding',
+  ]);
+
+  await page.getByRole('link', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('heading', { name: 'Settings', exact: true }).waitFor();
+  assert.equal(new URL(page.url()).pathname, '/settings');
+  const session = await page.evaluate(async () => {
+    const { api } = await window.importDashboard('/src/lib/api.ts');
+    return api.session();
+  });
+  assert.equal(session.setup.stage, 'configure', 'Recovery does not complete setup');
+  await page.getByRole('link', { name: 'Reviews', exact: true }).click();
+  await page.getByRole('heading', { name: 'Connect your review models', exact: true }).waitFor();
+  assert.equal(new URL(page.url()).pathname, '/setup', 'Other pages remain setup-gated');
+  await page.locator('summary').filter({ hasText: 'Repository search' }).click();
+  await page.getByLabel('Enable Vera retrieval', { exact: true }).click();
+  await page.evaluate(() => {
+    window.failEmbedding = false;
+    window.testedRoles = [];
+  });
+  await page.getByRole('button', { name: 'Test connections', exact: true }).click();
+  await page.getByText('All tested connections are working.', { exact: true }).waitFor();
+  assert.deepEqual(await page.evaluate(() => window.testedRoles), ['investigator', 'validator']);
+  assert.equal(await page.getByText('Embedding: Failed', { exact: true }).count(), 0);
+  await page.getByRole('button', { name: 'Finish setup', exact: true }).click();
+  await page.getByRole('heading', { name: 'Overview', exact: true }).waitFor();
+  await context.close();
+
+  const signedOut = await open('/setup?stage=configure');
+  await signedOut.page.getByRole('link', { name: 'Open settings', exact: true }).waitFor();
+  await signedOut.page.evaluate(async () => {
+    const { api } = await window.importDashboard('/src/lib/api.ts');
+    await api.logout();
+  });
+  await signedOut.page.getByRole('link', { name: 'Open settings', exact: true }).click();
+  await signedOut.page.waitForURL(`${base}/setup`);
+  assert.equal(
+    await signedOut.page.getByRole('heading', { name: 'Settings', exact: true }).count(),
+    0,
+  );
+  await signedOut.context.close();
 }
 
 async function checkWizardReranker() {
@@ -256,7 +353,7 @@ vera:
 ${custom ? `  reranker: ${JSON.stringify(reranker)}\n` : ''}`;
     await page.evaluate(async (yaml) => {
       const path = '/src/lib/api.ts';
-      const { api } = await import(path);
+      const { api } = await window.importDashboard(path);
       await api.saveConfig(yaml);
     }, yaml);
     await page.getByRole('button', { name: 'Install on repositories', exact: true }).click();
@@ -305,7 +402,7 @@ async function checkReviewSettings() {
   await page.getByRole('button', { name: 'Save changes', exact: true }).click();
   await page.getByText('Settings saved.', { exact: true }).waitFor();
   const settings = await page.evaluate(async () => {
-    const { api } = await import('/src/lib/api.ts');
+    const { api } = await window.importDashboard('/src/lib/api.ts');
     return api.serverSettings();
   });
   assert.equal(settings.default_trigger, 'auto');
@@ -337,9 +434,15 @@ async function checkReviewSettings() {
   await page.getByLabel('Search repositories', { exact: true }).fill('worker');
   assert.equal(await page.locator('tbody tr').count(), 1);
   await page.getByLabel('Search repositories', { exact: true }).fill('');
-  await choose(page, 'Filter by trigger', 'Off');
-  assert.equal(await page.locator('tbody tr').count(), 1);
-  await choose(page, 'Filter by trigger', 'All triggers');
+  await page
+    .getByRole('group', { name: 'Filter by trigger' })
+    .getByRole('button', { name: /^Off / })
+    .click();
+  assert.equal(await page.locator('tbody tr').count(), 2);
+  await page
+    .getByRole('group', { name: 'Filter by trigger' })
+    .getByRole('button', { name: /^All / })
+    .click();
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(
     await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
@@ -402,7 +505,7 @@ web_search:
   await page.getByRole('button', { name: 'Save changes', exact: true }).click();
   await page.getByText('Settings saved.', { exact: true }).waitFor();
   await page.evaluate(async () => {
-    const { api } = await import('/src/lib/api.ts');
+    const { api } = await window.importDashboard('/src/lib/api.ts');
     const test = api.test;
     window.fallbackCalls = [];
     api.test = (role, fallback) => {
@@ -469,7 +572,7 @@ async function checkMentionsAndReviewDetail() {
   );
   for (const subscribed of [true, null]) {
     await page.evaluate(async (value) => {
-      const { api } = await import('/src/lib/api.ts');
+      const { api } = await window.importDashboard('/src/lib/api.ts');
       const overview = await api.overview();
       overview.app.issue_comment_subscribed = value;
       api.overview = async () => overview;
@@ -485,22 +588,204 @@ async function checkMentionsAndReviewDetail() {
     .click();
   await page
     .getByText(
-      'Investigator switched from gpt-5.2 to claude-sonnet-4-5: rate limit or server error.',
+      'Investigator switched from model-large to model-small: rate limit or server error.',
       { exact: true },
     )
     .waitFor();
-  await page.getByText('Validator skipped gemini-3-pro: key not set.', { exact: true }).waitFor();
+  await page
+    .getByText('Validator skipped model-alternative: key not set.', { exact: true })
+    .waitFor();
   assert.equal(await page.getByLabel('Review mode', { exact: true }).innerText(), 'Default (Deep)');
   await choose(page, 'Review mode', 'Quick');
   await page.getByRole('button', { name: 'Re-run review', exact: true }).click();
   await page.getByText('A new review has been queued.', { exact: true }).waitFor();
   const jobs = await page.evaluate(async () => {
-    const { api } = await import('/src/lib/api.ts');
+    const { api } = await window.importDashboard('/src/lib/api.ts');
     return api.jobs();
   });
   assert.equal(jobs.jobs[0].mode, 'quick');
   assert.equal(jobs.jobs[0].trigger, 'rerun');
   await context.close();
+}
+
+// Lane C: actionable accepted findings and explicit, opt-in diagnostics.
+async function checkAgentHandoff() {
+  const { context, page } = await open('/reviews/review-105');
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.getByRole('heading', { name: /^Accepted findings/ }).waitFor();
+  assert.equal(await page.locator('details.finding').count(), 2);
+  assert.equal(await page.getByText('Rejected candidate fixture', { exact: true }).count(), 0);
+  const expected = await page.evaluate(async () => {
+    const { api } = await window.importDashboard('/src/lib/api.ts');
+    return api.job('review-105');
+  });
+  assert.equal('diagnostics' in expected, false);
+  assert.equal(expected.counts.total, expected.findings.length);
+  await page
+    .getByText("Validator's suggested remedy — not a tested patch", { exact: true })
+    .first()
+    .waitFor();
+  await page.getByRole('button', { name: 'Copy prompt', exact: true }).first().click();
+  assert.equal(
+    await page.evaluate(() => navigator.clipboard.readText()),
+    expected.findings[0].prompt,
+  );
+  assert.equal(
+    (await page.evaluate(() => navigator.clipboard.readText())).includes(expected.findings[1].id),
+    false,
+  );
+  await page.getByRole('button', { name: 'Copy fix instructions', exact: true }).click();
+  assert.equal(await page.evaluate(() => navigator.clipboard.readText()), expected.instructions);
+  assert.equal(expected.instructions.includes('Rejected candidate fixture'), false);
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Download .md', exact: true }).click();
+  const download = await downloadPromise;
+  assert.equal(download.suggestedFilename(), 'revera-instructions.md');
+  const stream = await download.createReadStream();
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  assert.equal(Buffer.concat(chunks).toString(), expected.instructions);
+  await page.getByRole('button', { name: 'Show diagnostics', exact: true }).click();
+  await page
+    .getByRole('heading', { name: 'Not validated — not reported as defects', exact: true })
+    .waitFor();
+  await page.getByText('Rejected candidate fixture', { exact: false }).waitFor();
+  await page.getByText('Uncertain candidate fixture', { exact: false }).waitFor();
+  assert.equal(await page.locator('details.finding').count(), 2);
+  await page.locator('details.finding').nth(1).locator('summary').click();
+  assert.equal(await page.getByRole('button', { name: 'Copy prompt', exact: true }).count(), 2);
+  await page.getByRole('button', { name: 'Hide diagnostics', exact: true }).click();
+  await page.getByRole('button', { name: 'Show diagnostics', exact: true }).waitFor();
+  assert.equal(await page.locator('.diagnostic').count(), 0);
+  await page.evaluate(async () => {
+    const { setMockReviewStale } = await window.importDashboard('/src/lib/mock.ts');
+    setMockReviewStale('review-105', true);
+  });
+  await page.getByText('Potentially stale', { exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Copy fix instructions', exact: true }).click();
+  assert.ok(
+    (await page.evaluate(() => navigator.clipboard.readText())).includes('Potentially stale'),
+  );
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await context.close();
+
+  for (const [id, status] of [
+    ['review-103', 'partial'],
+    ['review-102', 'failed'],
+    ['review-101', 'skipped'],
+  ]) {
+    const { context, page } = await open(`/reviews/${id}`);
+    if (status === 'skipped') {
+      // The review may load before the authenticated layout subscribes to SSE.
+      // Wait for that subscription before sending an event-only fixture update.
+      await page.waitForFunction(async () => {
+        const { live } = await window.importDashboard('/src/lib/events.ts');
+        let connected = false;
+        const stop = live.subscribe((state) => (connected = state.connected));
+        stop();
+        return connected;
+      });
+      await page.evaluate(async () => {
+        const { setMockReviewStatus } = await window.importDashboard('/src/lib/mock.ts');
+        setMockReviewStatus('review-101', 'skipped');
+      });
+    }
+    await page
+      .getByRole('note')
+      .filter({ hasText: `Review ${status}. This is not a clean result.` })
+      .waitFor();
+    assert.equal(
+      await page.getByRole('button', { name: 'Copy fix instructions', exact: true }).count(),
+      0,
+    );
+    await context.close();
+  }
+  const clean = await open('/reviews/review-101');
+  await clean.page.getByText('No accepted findings in this review.', { exact: true }).waitFor();
+  assert.equal(await clean.page.getByRole('note').count(), 0);
+  assert.equal(
+    await clean.page.getByRole('button', { name: 'Copy fix instructions', exact: true }).count(),
+    0,
+  );
+  await clean.context.close();
+
+  const carried = await open('/reviews/review-101');
+  await carried.context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await carried.page.getByText('No accepted findings in this review.', { exact: true }).waitFor();
+  await carried.page.waitForFunction(async () => {
+    const { live } = await window.importDashboard('/src/lib/events.ts');
+    let connected = false;
+    const stop = live.subscribe((state) => (connected = state.connected));
+    stop();
+    return connected;
+  });
+  await carried.page.evaluate(async () => {
+    const { setMockReviewCarried } = await window.importDashboard('/src/lib/mock.ts');
+    setMockReviewCarried('review-101');
+  });
+  const group = carried.page.getByRole('region', {
+    name: 'Still open from earlier reviews',
+    exact: true,
+  });
+  await group.getByRole('heading', { name: /^Still open from earlier reviews/ }).waitFor();
+  assert.equal(await group.locator('details.finding').count(), 1);
+  assert.equal(
+    await carried.page
+      .getByRole('region', { name: 'Accepted findings', exact: true })
+      .locator('details.finding')
+      .count(),
+    0,
+  );
+  await group.getByText(/Reported at an earlier commit; line numbers may have moved/).waitFor();
+  const expectedCarried = await carried.page.evaluate(async () => {
+    const { api } = await window.importDashboard('/src/lib/api.ts');
+    return api.job('review-101');
+  });
+  assert.equal(expectedCarried.counts.total, 0);
+  assert.equal(expectedCarried.carried.length, 1);
+  assert.equal(expectedCarried.carried[0].validation_status, null);
+  const mixedFixtures = await carried.page.evaluate(async () => {
+    const { api } = await window.importDashboard('/src/lib/api.ts');
+    const { setMockReviewCarried } = await window.importDashboard('/src/lib/mock.ts');
+    setMockReviewCarried('review-104');
+    setMockReviewCarried('review-105');
+    return Promise.all([api.job('review-104'), api.job('review-105')]);
+  });
+  assert.equal(mixedFixtures[0].carried.length, 1);
+  assert.equal(mixedFixtures[1].carried.length, 0);
+  for (const fixture of mixedFixtures) {
+    assert.equal(
+      fixture.carried.some((carried) =>
+        fixture.findings.some((current) => current.id === carried.id),
+      ),
+      false,
+    );
+  }
+  await group.getByRole('button', { name: 'Copy prompt', exact: true }).click();
+  assert.equal(
+    await carried.page.evaluate(() => navigator.clipboard.readText()),
+    expectedCarried.carried[0].prompt,
+  );
+  await carried.page.getByRole('button', { name: 'Copy fix instructions', exact: true }).click();
+  assert.equal(
+    await carried.page.evaluate(() => navigator.clipboard.readText()),
+    expectedCarried.instructions,
+  );
+  const carriedDownloadPromise = carried.page.waitForEvent('download');
+  await carried.page.getByRole('button', { name: 'Download .md', exact: true }).click();
+  const carriedStream = await (await carriedDownloadPromise).createReadStream();
+  const carriedChunks = [];
+  for await (const chunk of carriedStream) carriedChunks.push(chunk);
+  assert.equal(Buffer.concat(carriedChunks).toString(), expectedCarried.instructions);
+  await carried.page.getByRole('link', { name: 'Fix with Revera', exact: true }).click();
+  await carried.page
+    .getByRole('heading', { name: 'Generate a fix preview', exact: true })
+    .waitFor();
+  await carried.page.getByText(expectedCarried.carried[0].title, { exact: true }).waitFor();
+  await carried.page.getByRole('checkbox').uncheck();
+  await carried.page.getByText('Select at least one finding to fix.', { exact: true }).waitFor();
+  await carried.context.close();
 }
 
 async function checkThemeAndRetrievalLink() {
@@ -649,7 +934,444 @@ async function checkAuditSettings() {
   await context.close();
 }
 
+async function checkDashboardQol() {
+  const { context, page } = await open('/repositories');
+  await page.getByRole('heading', { name: 'Repositories', exact: true }).waitFor();
+  await page.locator('tbody tr').first().waitFor();
+  const names = () => page.locator('tbody .row-title').allTextContents();
+  const recentOrder = await names();
+  assert.equal(recentOrder.length, 12);
+  await choose(page, 'Sort repositories', 'Sort: Name');
+  const nameOrder = await names();
+  assert.notDeepEqual(nameOrder, recentOrder, 'Name sort changes row order');
+  assert.deepEqual(
+    nameOrder,
+    [...nameOrder].sort((a, b) => a.localeCompare(b)),
+  );
+  assert.equal(new URL(page.url()).searchParams.get('sort'), 'name');
+  const segments = page.getByRole('group', { name: 'Filter by trigger' });
+  await segments.getByRole('button', { name: /^Auto / }).click();
+  assert.equal(await page.locator('tbody tr').count(), 3);
+  assert.equal(new URL(page.url()).searchParams.get('trigger'), 'auto');
+  await page.reload();
+  await page.getByLabel('Sort repositories', { exact: true }).waitFor();
+  assert.equal(
+    await page.getByLabel('Sort repositories', { exact: true }).innerText(),
+    'Sort: Name',
+  );
+  assert.equal(
+    await segments.getByRole('button', { name: /^Auto / }).getAttribute('aria-pressed'),
+    'true',
+  );
+  await segments.getByRole('button', { name: /^All / }).click();
+  await page.getByLabel('Select northstar/api', { exact: true }).check();
+  await page.getByLabel('Select northstar/billing', { exact: true }).check();
+  assert.equal(
+    await page
+      .getByLabel('Select all visible repositories', { exact: true })
+      .evaluate((el) => el.indeterminate),
+    true,
+  );
+  await choose(page, 'Set trigger for selected repositories', 'Auto');
+  await page.getByText('Trigger set to Auto for 2 repositories.', { exact: true }).waitFor();
+  for (const name of ['api', 'billing'])
+    assert.equal(
+      await page.getByLabel(`Trigger for northstar/${name}`, { exact: true }).innerText(),
+      'Auto',
+    );
+  assert.equal(
+    await page.getByLabel('Set trigger for selected repositories', { exact: true }).innerText(),
+    'Set trigger…',
+  );
+  await choose(page, 'Set mode for selected repositories', 'Quick');
+  await page.getByText('Mode set to Quick for 2 repositories.', { exact: true }).waitFor();
+  for (const name of ['api', 'billing'])
+    assert.equal(
+      await page.getByLabel(`Mode for northstar/${name}`, { exact: true }).innerText(),
+      'Quick',
+    );
+  await page.getByLabel('Search repositories', { exact: true }).fill('api');
+  await page.getByText('1 selected', { exact: true }).waitFor();
+  assert.equal(new URL(page.url()).searchParams.get('q'), 'api');
+  await page.getByLabel('Search repositories', { exact: true }).fill('');
+  await page.getByLabel('Select all visible repositories', { exact: true }).check();
+  await page.getByText('12 selected', { exact: true }).waitFor();
+  await page
+    .getByLabel('Bulk repository actions')
+    .getByRole('button', { name: 'Index now', exact: true })
+    .click();
+  await page
+    .getByText(
+      'Index queued for 9 repositories. 2 skipped (reviews off). 1 skipped (index building).',
+      { exact: true },
+    )
+    .waitFor();
+  await choose(page, 'Activity', 'No activity in 30 days');
+  assert.deepEqual(await names(), ['northstar/docs', 'northstar/notifications', 'northstar/sdk']);
+  await page.getByRole('link', { name: 'Reviews', exact: true }).click();
+  await page.getByLabel('Search reviews', { exact: true }).fill('empty results');
+  await page.waitForFunction(
+    () => document.querySelector('.result-count')?.textContent === '1 job',
+  );
+  assert.equal(new URL(page.url()).searchParams.get('q'), 'empty results');
+  await page.getByLabel('Search reviews', { exact: true }).fill('#234');
+  await page.waitForFunction(
+    () => document.querySelector('.result-count')?.textContent === '1 job',
+  );
+  await page
+    .getByRole('link', { name: 'Handle empty results in repository search', exact: true })
+    .click();
+  await page.locator('.summary ul').first().waitFor();
+  assert.equal((await page.locator('.summary').innerText()).includes('##'), false);
+  assert.ok(await page.locator('.summary blockquote').count());
+  assert.ok(await page.locator('.summary code').count());
+  assert.equal(await page.locator('.summary-footer').count(), 1);
+  assert.ok(
+    (
+      await page
+        .getByRole('link', { name: 'src/search/results.ts:84', exact: true })
+        .getAttribute('href')
+    ).endsWith('/blob/8c74a1e9bf062d4a18f60c32/src/search/results.ts#L84'),
+  );
+  await page.getByRole('heading', { name: 'Model usage', exact: true }).waitFor();
+  await page.getByText('Raw report data', { exact: true }).click();
+  assert.ok((await page.locator('.data-disclosure pre').innerText()).includes('"stats"'));
+  const rendered = await page.evaluate(async () => {
+    const { renderSummary } = await import('/src/lib/markdown.ts');
+    return {
+      xss: renderSummary('<img src=x onerror=alert(1)> & " \' <script>alert(1)</script>'),
+      links: renderSummary('[safe](https://example.com/a?q=1&x=2) [unsafe](javascript:alert(1))'),
+      inline: renderSummary('`**literal**` **bold** _italic_ file_name_unchanged'),
+      example: renderSummary(
+        '## Revera review\n\n**Status: complete** — 1 new finding\n\n- **[medium]** `slop/compare.go`:146 — Negative deltas\n\n> Review incomplete: investigator reported 1 unchecked area(s).\n\n### Resolved since last review\n\n- shortSHA panics on abbreviated commits\n\n_Timing: total 75s_\n\n<sub>revera · strategy baseline</sub>',
+      ),
+    };
+  });
+  assert.equal(rendered.xss.includes('<img'), false);
+  assert.equal(rendered.xss.includes('<script'), false);
+  for (const entity of ['&lt;', '&gt;', '&amp;', '&quot;', '&#39;'])
+    assert.ok(rendered.xss.includes(entity));
+  assert.equal((rendered.links.match(/<a /g) || []).length, 1);
+  assert.ok(rendered.links.includes('rel="noreferrer" target="_blank"'));
+  assert.ok(rendered.inline.includes('<code>**literal**</code>'));
+  assert.ok(rendered.inline.includes('<strong>bold</strong>'));
+  assert.ok(rendered.inline.includes('<em>italic</em>'));
+  assert.ok(rendered.inline.includes('file_name_unchanged'));
+  for (const tag of ['<ul>', '<blockquote>', '<code>', '<h4>', 'summary-footer'])
+    assert.ok(rendered.example.includes(tag));
+  assert.equal(rendered.example.includes('##'), false);
+  await page.goto(`${base}/reviews?repo=northstar%2Fapi&status=complete&kind=review&q=%23227`);
+  await page.waitForFunction(
+    () => document.querySelector('.result-count')?.textContent === '1 job',
+  );
+  assert.equal(await page.getByLabel('Search reviews', { exact: true }).inputValue(), '#227');
+  assert.equal(await page.getByLabel('Repository', { exact: true }).innerText(), 'northstar/api');
+  assert.equal(await page.getByLabel('Status', { exact: true }).innerText(), 'Complete');
+  assert.equal(await page.getByLabel('Job kind', { exact: true }).innerText(), 'Reviews only');
+  await page.getByRole('link', { name: 'Repositories', exact: true }).click();
+  await page.getByRole('heading', { name: 'Repositories', exact: true }).waitFor();
+  await page.goBack();
+  await page.waitForFunction(
+    () => document.querySelector('.result-count')?.textContent === '1 job',
+  );
+  assert.equal(await page.getByLabel('Search reviews', { exact: true }).inputValue(), '#227');
+  await context.close();
+
+  const overview = await open('/');
+  await overview.page
+    .getByRole('group', { name: 'Overview period' })
+    .getByRole('button', { name: '7 days', exact: true })
+    .click();
+  await overview.page.getByText(/History keeps\s+the\s+last 500 jobs/).waitFor();
+  await overview.page.reload();
+  assert.equal(
+    await overview.page
+      .getByRole('group', { name: 'Overview period' })
+      .getByRole('button', { name: '7 days', exact: true })
+      .getAttribute('aria-pressed'),
+    'true',
+  );
+  await overview.page.getByRole('button', { name: 'Collapse navigation', exact: true }).click();
+  await overview.page.reload();
+  await overview.page.getByRole('button', { name: 'Expand navigation', exact: true }).waitFor();
+  await overview.context.close();
+
+  const settings = await open('/settings?tab=budgets');
+  await settings.page
+    .getByText('Quick: 12 tool calls and 2.5 min per agent, 7.5 min per review.', { exact: true })
+    .waitFor();
+  await settings.page
+    .getByText(
+      'Deep: 50 tool calls and 10 min per agent, 30 min and 240 requests per review, diffs up to 400 KB, up to 20 findings.',
+      { exact: true },
+    )
+    .waitFor();
+  await edit(settings.page, 'budget-agent_max_tool_calls', '40');
+  await settings.page
+    .getByText('Quick: 20 tool calls and 2.5 min per agent, 7.5 min per review.', { exact: true })
+    .waitFor();
+  const profiles = await settings.page.evaluate(async () => {
+    const { quickBudget, deepBudget } = await import('/src/lib/profiles.ts');
+    const b = {
+      agent_max_tool_calls: 1,
+      agent_max_seconds: 20,
+      run_max_seconds: 40,
+      run_max_requests: 120,
+      retries: 3,
+    };
+    return {
+      quick: quickBudget(b),
+      deep: deepBudget(
+        { ...b, agent_max_seconds: 4000, run_max_seconds: 2000 },
+        { max_diff_bytes: 500000, max_findings: 25 },
+      ),
+    };
+  });
+  assert.equal(profiles.quick.agent_max_tool_calls, 1);
+  assert.equal(profiles.quick.agent_max_seconds, 30);
+  assert.equal(profiles.quick.run_max_seconds, 60);
+  assert.equal(profiles.deep.agent_max_seconds, 4000);
+  assert.equal(profiles.deep.run_max_seconds, 3000);
+  assert.equal(profiles.deep.run_max_requests, 240);
+  assert.equal(profiles.deep.review.max_diff_bytes, 500000);
+  assert.equal(profiles.deep.review.max_findings, 25);
+  await settings.context.close();
+}
+
+// Lane B: URL review, private-source badge and explicit tracking chooser.
+async function checkExternalReviews() {
+  const { context, page } = await open('/reviews');
+  await page.getByRole('button', { name: 'Review PR URL', exact: true }).click();
+  await page.getByRole('dialog').getByRole('heading', { name: 'Review a public PR' }).waitFor();
+  await page.getByLabel('GitHub PR URL', { exact: true }).fill('https://evil.example/o/r/pull/1');
+  await page.getByRole('button', { name: 'Queue private review', exact: true }).click();
+  await page.getByText('Use https://github.com/OWNER/REPO/pull/NUMBER', { exact: true }).waitFor();
+  await page.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.getByRole('button', { name: 'Review PR URL', exact: true }).click();
+  assert.equal(
+    await page.getByText('Use https://github.com/OWNER/REPO/pull/NUMBER', { exact: true }).count(),
+    0,
+  );
+  await page
+    .getByLabel('GitHub PR URL', { exact: true })
+    .fill('https://github.com/community/project/pull/7');
+  await choose(page, 'External review mode', 'Quick');
+  await page.getByRole('button', { name: 'Queue private review', exact: true }).click();
+  await page.getByRole('dialog').waitFor({ state: 'hidden' });
+  await page.getByText('External · private', { exact: true }).waitFor();
+  const job = await page.evaluate(async () => {
+    const { api } = await window.importDashboard('/src/lib/api.ts');
+    return (await api.jobs()).jobs[0];
+  });
+  assert.equal(job.source, 'external');
+  assert.equal(job.publication, 'private');
+  assert.equal(job.mode, 'quick');
+  assert.equal(job.check_run_url, undefined);
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.evaluate(async (id) => {
+    const { setMockReviewStatus } = await window.importDashboard('/src/lib/mock.ts');
+    setMockReviewStatus(id, 'complete', { total: 1, high: 1, medium: 0, low: 0 });
+  }, job.id);
+  await page.getByRole('link', { name: 'Open review', exact: true }).click();
+  await page.getByText('External · private', { exact: true }).waitFor();
+  await page.getByRole('heading', { name: /^Accepted findings/ }).waitFor();
+  assert.equal(
+    await page.getByRole('link', { name: 'Pull request', exact: true }).getAttribute('href'),
+    job.pr_url,
+  );
+  assert.equal(await page.getByRole('link', { name: 'GitHub check', exact: true }).count(), 0);
+  const detail = await page.evaluate(async (id) => {
+    const { api } = await window.importDashboard('/src/lib/api.ts');
+    return api.job(id);
+  }, job.id);
+  await page.getByRole('button', { name: 'Copy prompt', exact: true }).click();
+  assert.equal(
+    await page.evaluate(() => navigator.clipboard.readText()),
+    detail.findings[0].prompt,
+  );
+  await page.getByRole('button', { name: 'Copy fix instructions', exact: true }).click();
+  assert.equal(await page.evaluate(() => navigator.clipboard.readText()), detail.instructions);
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Download .md', exact: true }).click();
+  const download = await downloadPromise;
+  const stream = await download.createReadStream();
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  assert.equal(Buffer.concat(chunks).toString(), detail.instructions);
+  assert.equal(
+    await page.getByRole('button', { name: 'Re-run review', exact: true }).isEnabled(),
+    true,
+  );
+  await page.getByRole('button', { name: 'Re-run review', exact: true }).click();
+  await page.getByText('A new review has been queued.', { exact: true }).waitFor();
+  const rerun = await page.evaluate(async () => {
+    const { api } = await window.importDashboard('/src/lib/api.ts');
+    return (await api.jobs()).jobs[0];
+  });
+  assert.equal(rerun.source, 'external');
+  assert.equal(rerun.publication, 'private');
+  assert.equal(rerun.mode, 'quick');
+  await page.getByRole('link', { name: 'All reviews', exact: true }).click();
+  await page.locator('summary').filter({ hasText: 'Track my external PRs' }).click();
+  await page.getByRole('button', { name: 'Find my open PRs', exact: true }).click();
+  const actions = page.locator('[aria-label="Choose action for community/small-project #1"]');
+  assert.equal(
+    await actions.getByRole('button', { name: 'Track', exact: true }).isEnabled(),
+    false,
+  );
+  await page.getByRole('link', { name: 'External PR settings', exact: true }).click();
+  await page
+    .getByRole('checkbox', { name: 'Enable external PR tracking for all users', exact: true })
+    .check();
+  await page.getByLabel('Check tracked PRs every (minutes)', { exact: true }).fill('15.5');
+  assert.equal(
+    await page.getByRole('button', { name: 'Save external settings', exact: true }).isEnabled(),
+    false,
+  );
+  await page.getByLabel('Check tracked PRs every (minutes)', { exact: true }).fill('30');
+  await page.getByRole('button', { name: 'Save external settings', exact: true }).click();
+  await page.getByText('External settings saved.', { exact: true }).waitFor();
+  await page.getByRole('link', { name: 'Reviews', exact: true }).click();
+  await page.locator('summary').filter({ hasText: 'Track my external PRs' }).click();
+  await page.getByRole('button', { name: 'Find my open PRs', exact: true }).click();
+  await actions.getByRole('button', { name: 'Track', exact: true }).click();
+  await page.getByRole('button', { name: 'Untrack', exact: true }).waitFor();
+  const ignored = page.locator('[aria-label="Choose action for community/small-project #2"]');
+  await ignored.getByRole('button', { name: 'Ignore', exact: true }).click();
+  await page.getByText('PR ignored in discovery.', { exact: true }).waitFor();
+  await page
+    .locator('[aria-label="Choose action for community/small-project #3"]')
+    .getByRole('button', { name: 'Review once', exact: true })
+    .click();
+  await page.getByText('Private review queued.', { exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Untrack', exact: true }).click();
+  await page.getByText('stopped · untracked manually', { exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Find my open PRs', exact: true }).click();
+  assert.equal(await ignored.count(), 0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await context.close();
+}
+
+// Connected accounts and explicit setup capability choices.
+async function checkConnectedAccounts() {
+  const { context, page } = await open('/repositories');
+  const panel = page.getByRole('region', { name: 'Connected accounts', exact: true });
+  await panel.getByRole('heading', { name: 'Connected accounts', exact: true }).waitFor();
+  assert.equal(
+    await page.getByRole('link', { name: 'Add repositories or organization' }).getAttribute('href'),
+    'https://github.com/apps/revera-northstar/installations/new',
+  );
+  const second = panel.locator('[data-account="second-org"]');
+  await second.getByText('Awaiting Revera approval', { exact: true }).waitFor();
+  assert(
+    !/\d+ repositories/.test(await second.innerText()),
+    'Unapproved accounts have no repository count',
+  );
+  await panel
+    .locator('[data-account="upgrade-org"]')
+    .getByText('Permission update required', { exact: true })
+    .waitFor();
+  await panel
+    .locator('[data-account="paused-org"]')
+    .getByText('Suspended', { exact: true })
+    .waitFor();
+  await panel
+    .locator('[data-account="offline-org"]')
+    .getByText('Not installed', { exact: true })
+    .waitFor();
+  await panel
+    .locator('[data-account="denied-org"]')
+    .getByText('Access unavailable', { exact: true })
+    .waitFor();
+  await second.getByRole('button', { name: 'Approve second-org', exact: true }).click();
+  await second.getByText('Allowed', { exact: true }).waitFor();
+  await second
+    .getByText('Organization · 0 repositories · Selected repositories', { exact: true })
+    .waitFor();
+  page.once('dialog', (dialog) => dialog.accept());
+  await second.getByRole('button', { name: 'Revoke second-org', exact: true }).click();
+  await second.getByText('Awaiting Revera approval', { exact: true }).waitFor();
+  await panel
+    .getByText('Connecting another organization or enabling write permissions', { exact: true })
+    .click();
+  assert.equal(
+    await panel
+      .getByRole('link', { name: 'GitHub app settings → Advanced → Make public' })
+      .getAttribute('href'),
+    'https://github.com/organizations/northstar/settings/apps/revera-northstar/advanced',
+  );
+  await page.evaluate(async () => {
+    const { api } = await window.importDashboard('/src/lib/api.ts');
+    const reconcile = api.reconcileInstallations;
+    window.accountReconciles = 0;
+    api.reconcileInstallations = () => {
+      window.accountReconciles++;
+      return reconcile();
+    };
+  });
+  await page.getByRole('link', { name: 'Reviews', exact: true }).click();
+  await page.getByRole('heading', { name: 'Reviews', exact: true }).waitFor();
+  await page.getByRole('link', { name: 'Repositories', exact: true }).evaluate((link) => {
+    link.href += '?installation_id=2&setup_action=install';
+  });
+  await page.getByRole('link', { name: 'Repositories', exact: true }).click();
+  await page.waitForFunction(() => window.accountReconciles === 1);
+  await panel.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.waitForFunction(() => window.accountReconciles === 2);
+  await context.close();
+}
+
+async function checkManifestChoices() {
+  for (const publicApp of [false, true]) {
+    const { context, page } = await open('/setup?stage=create_app&token=fixture');
+    await page.getByRole('heading', { name: 'Create your GitHub App', exact: true }).waitFor();
+    assert.equal(
+      await page.getByLabel('Allow Revera to publish approved fixes', { exact: true }).isChecked(),
+      false,
+    );
+    assert.equal(
+      await page.getByLabel('Who can install this app?', { exact: true }).innerText(),
+      'Only this account',
+    );
+    if (publicApp) {
+      await choose(page, 'Who can install this app?', 'Any account or organization');
+      await page.getByLabel('Allow Revera to publish approved fixes', { exact: true }).check();
+    }
+    await page.evaluate(async () => {
+      const { api } = await window.importDashboard('/src/lib/api.ts');
+      const manifest = api.manifest;
+      api.manifest = async (...args) => {
+        const result = await manifest(...args);
+        window.createdManifest = result.manifest;
+        return result;
+      };
+    });
+    await page.getByRole('button', { name: 'Create GitHub App', exact: true }).click();
+    await page.getByRole('heading', { name: 'Sign in with GitHub', exact: true }).waitFor();
+    const manifest = await page.evaluate(() => window.createdManifest);
+    assert.equal(manifest.public, publicApp);
+    assert.equal(manifest.default_permissions.contents, publicApp ? 'write' : 'read');
+    assert.equal(manifest.setup_url, 'https://revera.northstar.example.com/repositories');
+    assert.equal(manifest.setup_on_update, true);
+    await context.close();
+  }
+}
+
 try {
+  if (!emptyYaml && !process.argv.includes('--screenshots-only'))
+    await checkReviewRegressions({ open, choose, edit });
+  if (!emptyYaml && !process.argv.includes('--screenshots-only')) await checkExternalReviews();
+  if (!emptyYaml && !process.argv.includes('--screenshots-only'))
+    await checkFixes({ open, choose, edit, savedConfig });
+  if (!emptyYaml && !process.argv.includes('--checks-only'))
+    await fixScreenshots({ open, choose, output });
+  if (!process.argv.includes('--screenshots-only')) {
+    await checkConnectedAccounts();
+    await checkManifestChoices();
+  }
+  if (!emptyYaml && !process.argv.includes('--screenshots-only')) await checkAgentHandoff();
+  if (!emptyYaml && !process.argv.includes('--screenshots-only')) await checkDashboardQol();
   if (!emptyYaml && !process.argv.includes('--screenshots-only')) await checkAuditSettings();
   if (!process.argv.includes('--screenshots-only')) await checkThemeAndRetrievalLink();
   if (!process.argv.includes('--screenshots-only')) await checkWizardReranker();
@@ -686,7 +1408,17 @@ try {
           await page.getByLabel('Run log output').waitFor();
         },
       );
-      await shot('/repositories', `repositories-${scheme}.png`, scheme, 'Repositories');
+      await shot(
+        '/repositories',
+        `repositories-${scheme}.png`,
+        scheme,
+        'Repositories',
+        async (page) => {
+          await page.getByLabel('Select northstar/api', { exact: true }).check();
+          await page.getByLabel('Select northstar/web', { exact: true }).check();
+          await page.getByText('2 selected', { exact: true }).waitFor();
+        },
+      );
       await shot('/settings', `settings-models-${scheme}.png`, scheme, 'Review models');
       await shot(
         '/settings?tab=review',
@@ -723,6 +1455,38 @@ try {
       );
       await page.screenshot({ path: join(output, 'overview-mobile-dark.png') });
       await context.close();
+    }
+    for (const scheme of ['light', 'dark']) {
+      for (const [route, name] of [
+        ['/', 'Overview'],
+        ['/repositories', 'Repositories'],
+        ['/reviews', 'Reviews'],
+        ['/reviews/review-105', 'Handle empty results in repository search'],
+      ]) {
+        const { context, page } = await open(route, scheme, { width: 800, height: 1000 });
+        await page.getByRole('heading', { name, exact: true }).waitFor();
+        if (route === '/repositories') {
+          await page.getByLabel('Select northstar/api', { exact: true }).check();
+          await page.getByLabel('Select northstar/web', { exact: true }).check();
+          const bar = await page.getByLabel('Bulk repository actions').boundingBox();
+          assert.ok(
+            bar && bar.y >= 0 && bar.y + bar.height <= 1000,
+            'Bulk bar stays in the viewport',
+          );
+        }
+        assert.equal(
+          await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+          true,
+          `${route} fits at 800px`,
+        );
+        await page.screenshot({
+          path: join(
+            output,
+            `${route === '/' ? 'overview' : route.includes('review-') ? 'review-detail' : route.slice(1)}-800-${scheme}.png`,
+          ),
+        });
+        await context.close();
+      }
     }
   }
 
@@ -786,6 +1550,7 @@ try {
     await checkReviewSettings();
     await checkMentionsAndReviewDetail();
     await checkSetupLink();
+    await checkSetupRecovery();
 
     // Selects retain labels, keyboard navigation, and empty filter values.
     for (const [scheme, viewport] of [
@@ -953,7 +1718,7 @@ try {
       await page.getByRole('link', { name: 'Reviews', exact: true }).click();
       await page.getByRole('link', { name: 'Manual review', exact: true }).waitFor();
       const saved = await page.evaluate(async () => {
-        const { api } = await import('/src/lib/api.ts');
+        const { api } = await window.importDashboard('/src/lib/api.ts');
         return api.jobs();
       });
       assert.equal(saved.jobs[0].mode, 'deep');
@@ -977,7 +1742,8 @@ try {
       'PASS: setup link authorization/copy, labelled keyboard selects in both themes/mobile, ' +
         'empty filters, wizard, YAML/comments/reasoning, secret dialog, server settings, ' +
         'trigger/mode defaults and overrides, mention notice/commands, fallback editor/tests, ' +
-        'web search, manual/rerun modes, live updates, audit settings, no browser runtime errors.',
+        'web search, manual/rerun modes, live updates, audit settings, repository sorting/filtering/bulk, ' +
+        'review search/URL, safe markdown, overview period/sidebar persistence, budget previews, no browser runtime errors.',
     );
   }
 } finally {

@@ -110,6 +110,7 @@ impl StateFinding {
     /// Rebuild a `Finding` for rechecking, from the retained detail.
     pub fn to_finding(&self) -> Finding {
         Finding {
+            suggestion: None,
             defect_key: self.defect_key.clone(),
             severity: self.severity,
             file: self.file.clone(),
@@ -124,12 +125,28 @@ impl StateFinding {
                 .evidence
                 .iter()
                 .map(|e| {
-                    let (loc, note) = e.split_once(' ').unwrap_or((e.as_str(), ""));
-                    let (path, line) = loc.rsplit_once(':').unwrap_or((loc, "0"));
+                    let (path, line, note) = e
+                        .match_indices(':')
+                        .find_map(|(index, _)| {
+                            let tail = &e[index + 1..];
+                            let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+                            let (line, rest) = tail.split_at(digits);
+                            if digits == 0 || (!rest.is_empty() && !rest.starts_with(' ')) {
+                                return None;
+                            }
+                            Some((&e[..index], line, rest.strip_prefix(' ').unwrap_or("")))
+                        })
+                        .unwrap_or_else(|| {
+                            let (loc, note) = e.split_once(' ').unwrap_or((e.as_str(), ""));
+                            let (path, line) = loc.rsplit_once(':').unwrap_or((loc, "0"));
+                            (path, line, note)
+                        });
+                    // Compact references keep only the first line.
+                    let start_line = line.parse().unwrap_or(0);
                     crate::findings::Evidence {
                         path: path.to_string(),
-                        start_line: line.parse().unwrap_or(0),
-                        end_line: 0,
+                        start_line,
+                        end_line: start_line,
                         note: note.to_string(),
                     }
                 })

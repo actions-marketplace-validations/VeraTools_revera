@@ -21,6 +21,7 @@ fn report_with_findings(inline: Vec<InlineComment>, findings: Vec<Finding>) -> R
         head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
         strategy: "baseline".into(),
         findings,
+        carried: vec![],
         plan: PublicationPlan {
             inline,
             summary_markdown: "## Revera review\n\n- finding\n".into(),
@@ -67,10 +68,226 @@ fn finding(id_body_file: &str) -> Finding {
         validation_status: Some(ValidationStatus::Accepted),
         suggested_fix: None,
         validated_fix: None,
+        suggestion: None,
         source: "investigator".into(),
         rationale: None,
         sources: vec![],
     }
+}
+
+#[test]
+fn handoff_and_fix_offer_require_completed_accepted_findings() {
+    use revera::handoff::Context;
+    let context = Context {
+        repo: "acme/widgets",
+        pr_url: "https://github.com/acme/widgets/pull/42",
+        base: "bbbb",
+        head: "aaaa",
+        review_url: Some("https://review.example/reviews/1"),
+        stale: Some(false),
+    };
+    for (status, accepted) in [
+        (RunStatus::Complete, true),
+        (RunStatus::Complete, false),
+        (RunStatus::Partial, true),
+        (RunStatus::Failed, true),
+    ] {
+        let mut f = finding("src/x.rs");
+        if !accepted {
+            f.validation_status = Some(ValidationStatus::Rejected);
+        }
+        let mut report = report_with_findings(vec![], vec![f]);
+        report.status = status;
+        revera::report::append_handoff(
+            &mut report,
+            &context,
+            Some("https://review.example/fixes/new?job=1"),
+            "revera-test[bot]",
+        );
+        let eligible = status == RunStatus::Complete && accepted;
+        assert_eq!(
+            report
+                .plan
+                .summary_markdown
+                .contains("Fix with your coding agent"),
+            eligible
+        );
+        assert_eq!(
+            report.plan.summary_markdown.contains("Fix with Revera"),
+            eligible
+        );
+        assert_eq!(
+            report.plan.summary_markdown.contains("`@revera-test fix`"),
+            eligible
+        );
+        if eligible {
+            let opening = concat!(
+                "<details>",
+                "<",
+                "summary>",
+                "Fix with your coding agent",
+                "<",
+                "/summary>"
+            );
+            assert!(report.plan.summary_markdown.contains(opening));
+            assert!(report.plan.summary_markdown.contains("```text"));
+            assert!(
+                report
+                    .plan
+                    .summary_markdown
+                    .contains("https://review.example/reviews/1")
+            );
+            revera::report::mark_incomplete_summary(&mut report);
+            assert!(!report.plan.summary_markdown.contains(opening));
+            assert!(
+                !report
+                    .plan
+                    .summary_markdown
+                    .contains("Fix with your coding agent")
+            );
+            assert!(!report.plan.summary_markdown.contains("Fix with Revera"));
+            assert!(report.plan.summary_markdown.contains("Review incomplete"));
+        }
+    }
+    let mut report = report_with_findings(vec![], vec![finding("src/x.rs")]);
+    revera::report::append_handoff(&mut report, &context, None, "bot[bot]");
+    assert!(!report.plan.summary_markdown.contains("Fix with Revera"));
+    let mut large = finding("src/x.rs");
+    large.claim = "x".repeat(4000);
+    let mut report = report_with_findings(vec![], vec![large]);
+    revera::report::append_handoff(&mut report, &context, None, "bot[bot]");
+    assert!(
+        report
+            .plan
+            .summary_markdown
+            .contains("Fix with your coding agent")
+    );
+    assert!(!report.plan.summary_markdown.contains("```text"));
+}
+
+#[test]
+fn carried_only_summary_keeps_instructions_and_fix_offer_without_new_publication() {
+    let f = finding("src/bug.rs");
+    let mut state = ReviewState::default();
+    state.upsert(&f, FindingState::Open);
+    state.mark_posted(&[f.id()]);
+    let mut report = report(vec![]);
+    report.carried = revera::report::carried_findings(&state, &[]);
+    report.plan.summary_markdown = revera::report::summary_markdown(&revera::report::Summary {
+        carried_open: report.carried.len(),
+        ..Default::default()
+    });
+    let context = revera::handoff::Context {
+        repo: "owner/repo",
+        pr_url: "https://github.com/owner/repo/pull/1",
+        base: "bbbb",
+        head: "aaaa",
+        review_url: None,
+        stale: Some(false),
+    };
+    revera::report::append_handoff(
+        &mut report,
+        &context,
+        Some("https://review.example/fixes/new?job=1"),
+        "app[bot]",
+    );
+    let summary = &report.plan.summary_markdown;
+    for expected in [
+        "no accepted findings, 1 still open from earlier runs",
+        "Fix with your coding agent",
+        "Want Revera to fix these?",
+        "Fix with Revera",
+        "Still open from earlier reviews",
+        "line numbers may have moved",
+        &f.id(),
+    ] {
+        assert!(summary.contains(expected), "{expected}: {summary}");
+    }
+    assert!(report.plan.inline.is_empty());
+    assert!(revera::report::surfaced_ids(&report).is_empty());
+    assert!(!revera::pipeline::anchor::is_publishable(
+        &report.carried[0].to_finding()
+    ));
+    report.status = RunStatus::Partial;
+    report.plan.summary_markdown.clear();
+    revera::report::append_handoff(
+        &mut report,
+        &context,
+        Some("https://review.example/fixes/new?job=1"),
+        "app[bot]",
+    );
+    assert!(report.plan.summary_markdown.is_empty());
+}
+
+#[test]
+fn reports_without_carried_field_load_and_empty_carried_is_omitted() {
+    let old = serde_json::to_value(report(vec![])).unwrap();
+    assert!(old.get("carried").is_none());
+    let loaded: RunReport = serde_json::from_value(old).unwrap();
+    assert!(loaded.carried.is_empty());
+}
+
+#[tokio::test]
+async fn managed_summary_preserves_server_fix_status_verbatim_before_state() {
+    let server = MockServer::start().await;
+    mount_no_review_comments(&server).await;
+    let block = "<!-- revera:fix-status -->\n**Fix ready** [Preview](https://review.example/fixes/1)\n<!-- /revera:fix-status -->";
+    let mut state = ReviewState::default();
+    let mut open = finding("src/my_*file.rs");
+    open.title = "Use `checked_add`\nnot [x](https://evil) <a href=evil> @someone".into();
+    state.upsert(&open, FindingState::Open);
+    let mut ticks = finding("src/a`b``c.rs");
+    ticks.title = "Preserve the literal path".into();
+    state.upsert(&ticks, FindingState::Open);
+    let old = format!(
+        "<!-- revera-summary -->\nOld summary\n{block}\n{}",
+        encode_state(&state)
+    );
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/pulls/42"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"head": {"sha": "a".repeat(40)}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/issues/42/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!([{"id": 555, "body": old, "user": {"login": "bot[bot]", "type": "Bot"}}]),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/acme/widgets/issues/comments/555"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 555})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = GitHubApi::with_base(&server.uri(), "t");
+    let mut report = report(vec![]);
+    publish(
+        &api,
+        &event(),
+        &mut report,
+        &mut state.clone(),
+        10,
+        "<!-- revera-summary -->",
+        "bot[bot]",
+    )
+    .await
+    .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let request = requests
+        .iter()
+        .find(|r| r.method.as_str() == "PATCH")
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    let body = body["body"].as_str().unwrap();
+    assert_eq!(revera::github::publish::fix_status_block(body), Some(block));
+    assert_eq!(body.matches("<!-- revera:fix-status -->").count(), 1);
+    assert!(body.find(block).unwrap() < body.find("<!-- revera-state:").unwrap());
+    assert!(body.contains("- `src/my_*file.rs`:3 — Use `checked_add` not \\[x\\](h\u{200b}ttps://evil) &lt;a href=evil> @\u{200b}someone\n"));
+    assert!(body.contains("- ```src/a`b``c.rs```:3 — Preserve the literal path\n"));
 }
 
 async fn mount_no_review_comments(server: &MockServer) {

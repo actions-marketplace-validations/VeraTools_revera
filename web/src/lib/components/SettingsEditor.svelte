@@ -6,6 +6,7 @@
   import { Save, Check } from '@lucide/svelte';
   import { api, errorMessage } from '#lib/api';
   import { ConfigDocument, backends, triggers, modes } from '#lib/config.svelte';
+  import { quickBudget, deepBudget, type Budget } from '#lib/profiles';
   import type {
     Settings,
     Secret,
@@ -14,6 +15,7 @@
     TestResult,
     Trigger,
     ReviewMode,
+    FixSettings as FixSettingsData,
   } from '#lib/types';
   import ModelFields from './ModelFields.svelte';
   import SecretDialog from './SecretDialog.svelte';
@@ -25,8 +27,10 @@
   import FallbackModels from './FallbackModels.svelte';
   import WebSearchFields from './WebSearchFields.svelte';
   import MentionCommands from './MentionCommands.svelte';
+  import FixSettings from './FixSettings.svelte';
+  import { validFixLimits } from '../fix-policy';
 
-  const tabs = ['Models', 'Review', 'Budgets', 'Retrieval', 'Access', 'Advanced'];
+  const tabs = ['Models', 'Review', 'Fixes', 'Budgets', 'Retrieval', 'Access', 'Advanced'];
   const modelRoles = [
     {
       role: 'investigator',
@@ -42,6 +46,11 @@
   let tab = $state('models');
   let config = $state<ConfigDocument>();
   let server = $state<ServerSettings>();
+  let fixSettings = $state<FixSettingsData>();
+  let savedFixes = $state('');
+  let fixFormValid = $state(true);
+  const fixesDirty = $derived(!!fixSettings && JSON.stringify(fixSettings.fixes) !== savedFixes);
+  const fixesValid = $derived(fixFormValid && (!fixSettings || validFixLimits(fixSettings.fixes)));
   let secrets = $state<Secret[]>([]);
   let savedYaml = $state('');
   let savedServer = $state('');
@@ -57,7 +66,7 @@
   let separateValidator = $state(false);
   const yamlDirty = $derived(config?.yaml !== savedYaml);
   const serverDirty = $derived(JSON.stringify(server) !== savedServer);
-  const dirty = $derived(!!config && (yamlDirty || serverDirty));
+  const dirty = $derived(!!config && (yamlDirty || serverDirty || fixesDirty));
   const envNames = $derived(config?.referencedEnv() || []);
   const validatorInherits = $derived(!!config && !config.has(['models', 'validator']));
   const retrievalOn = $derived(
@@ -73,7 +82,10 @@
   }
   async function load() {
     try {
-      hydrate(await api.settings());
+      const [settings, fixes] = await Promise.all([api.settings(), api.fixSettings()]);
+      hydrate(settings);
+      fixSettings = fixes;
+      savedFixes = JSON.stringify(fixes.fixes);
       error = '';
     } catch (cause) {
       error = errorMessage(cause);
@@ -100,7 +112,7 @@
     }
   }
   async function save() {
-    if (!config || !server || config.errors.length) return;
+    if (!config || !server || config.errors.length || !fixesValid) return;
     busy = 'save';
     error = '';
     message = '';
@@ -116,12 +128,17 @@
         await api.saveServer(server);
         savedServer = JSON.stringify(server);
       }
+      if (fixesDirty && fixSettings) {
+        await api.saveFixSettings(fixSettings.fixes);
+        savedFixes = JSON.stringify(fixSettings.fixes);
+      }
+      if (fixSettings) fixSettings.models = (await api.fixSettings()).models;
       secrets = (await api.settings()).secrets;
       message = 'Settings saved.';
     } catch (cause) {
       const partialSave =
-        configSaved && serverDirty
-          ? ' Review configuration was saved; server settings are still unsaved.'
+        configSaved && (serverDirty || fixesDirty)
+          ? ` Review configuration was saved; ${[serverDirty ? 'server settings' : '', fixesDirty ? 'fix policy' : ''].filter(Boolean).join(' and ')} changes are still unsaved.`
           : '';
       error = errorMessage(cause) + partialSave;
     } finally {
@@ -132,6 +149,8 @@
     config?.replace(savedYaml);
     separateValidator = config?.has(['models', 'validator']) || false;
     server = JSON.parse(savedServer) as ServerSettings;
+    if (fixSettings) fixSettings.fixes = JSON.parse(savedFixes);
+    fixFormValid = true;
     error = '';
     message = '';
   }
@@ -246,6 +265,27 @@
       hint: 'Retry failed requests, respecting the endpoint’s retry delay.',
     },
   ];
+  // Number inputs are empty (NaN) mid-edit; keep the last valid value until then.
+  function setNumber(path: (string | number)[], value: number) {
+    if (Number.isFinite(value)) config!.set(path, value);
+  }
+  const numberAt = (path: string[], fallback: number) => {
+    const value = config?.get(path, fallback);
+    return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+  };
+  const budget = $derived(
+    Object.fromEntries(
+      budgetFields.map((field) => [field.key, numberAt(['budget', field.key], field.value)]),
+    ) as unknown as Budget,
+  );
+  const quick = $derived(quickBudget(budget));
+  const deep = $derived(
+    deepBudget(budget, {
+      max_diff_bytes: numberAt(['review', 'max_diff_bytes'], 200000),
+      max_findings: numberAt(['review', 'max_findings'], 10),
+    }),
+  );
+  const minutes = (seconds: number) => Number((seconds / 60).toFixed(1));
 </script>
 
 <svelte:window onbeforeunload={beforeUnload} />
@@ -369,6 +409,19 @@
           </div>{:else}<p class="helper">This configuration does not reference any keys.</p>{/each}
       </section>
     </Tabs.Content>
+    <Tabs.Content value="fixes">
+      {#if fixSettings}<FixSettings
+          data={fixSettings}
+          {config}
+          {secrets}
+          {setKey}
+          removeKey={removeSecret}
+          disabled={dirty || !!busy}
+          test={(role) => void test(role)}
+          {tests}
+          bind:valid={fixFormValid}
+        />{/if}
+    </Tabs.Content>
     <Tabs.Content value="review"
       ><section class="settings-section">
         <div class="section-heading">
@@ -436,8 +489,8 @@
               type="number"
               min="1"
               value={config.get(['review', 'max_findings'], 10)}
-              onchange={(event) =>
-                config!.set(['review', 'max_findings'], event.currentTarget.valueAsNumber)}
+              oninput={(event) =>
+                setNumber(['review', 'max_findings'], event.currentTarget.valueAsNumber)}
             />
           </div>
         </div>
@@ -486,8 +539,20 @@
             <h2>Review limits</h2>
             <p>A limit stops the affected stage and marks the review partial.</p>
             <p>
-              Quick and Deep change tool calls per agent, seconds per agent, and seconds per review.
-              Deep also changes the largest diff and maximum findings.
+              {#if config.get(['profiles', 'quick'], null) !== null}Quick uses the <code>quick</code
+                > profile from your configuration.
+              {:else}Quick: {quick.agent_max_tool_calls} tool calls and {minutes(
+                  quick.agent_max_seconds,
+                )} min per agent, {minutes(quick.run_max_seconds)} min per review.{/if}
+            </p>
+            <p>
+              {#if config.get(['profiles', 'deep'], null) !== null}Deep uses the <code>deep</code> profile
+                from your configuration.
+              {:else}Deep: {deep.agent_max_tool_calls} tool calls and {minutes(
+                  deep.agent_max_seconds,
+                )} min per agent, {minutes(deep.run_max_seconds)} min and {deep.run_max_requests} requests
+                per review, diffs up to {Number((deep.review.max_diff_bytes / 1000).toFixed(1))} KB, up
+                to {deep.review.max_findings} findings.{/if}
             </p>
           </div>
         </div>
@@ -498,8 +563,8 @@
                 type="number"
                 min={field.key === 'retries' ? 0 : 1}
                 value={config.get(['budget', field.key], field.value)}
-                onchange={(event) =>
-                  config!.set(['budget', field.key], event.currentTarget.valueAsNumber)}
+                oninput={(event) =>
+                  setNumber(['budget', field.key], event.currentTarget.valueAsNumber)}
               /><small>{field.hint}</small>
             </div>{/each}
           <div class="field">
@@ -508,8 +573,8 @@
               type="number"
               min="1"
               value={config.get(['review', 'max_diff_bytes'], 200000)}
-              onchange={(event) =>
-                config!.set(['review', 'max_diff_bytes'], event.currentTarget.valueAsNumber)}
+              oninput={(event) =>
+                setNumber(['review', 'max_diff_bytes'], event.currentTarget.valueAsNumber)}
             /><small
               >In bytes. Files that do not fit are left out and the review is marked partial.</small
             >
@@ -633,7 +698,7 @@
           <button class="button small" onclick={validate}><Check size={14} />Validate YAML</button
           ><button
             class="button small"
-            disabled={!!busy || !dirty || config.errors.length > 0}
+            disabled={!!busy || !dirty || config.errors.length > 0 || !fixesValid}
             onclick={save}><Save size={14} />Save</button
           >
         </div>
@@ -661,7 +726,7 @@
       <div class="actions">
         <button class="button small" disabled={!!busy} onclick={discard}>Discard</button><button
           class="button primary small"
-          disabled={!!busy || config.errors.length > 0}
+          disabled={!!busy || config.errors.length > 0 || !fixesValid}
           onclick={save}>{busy === 'save' ? 'Saving…' : 'Save changes'}</button
         >
       </div>
