@@ -5,7 +5,7 @@ use super::{
 use crate::config::{ModelRoute, ReasoningEffort};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Stable id for this process run, used by routes that set `session_header`
@@ -59,11 +59,38 @@ impl Default for AttemptState {
     }
 }
 
+impl AttemptState {
+    /// Merge only rejected-field adjustments: token key, temperature and cache hints.
+    /// Reasoning fallbacks and retry guards stay per-request and are never copied.
+    fn merge_adjustments(&mut self, other: &Self) {
+        if other.tokens_key == "max_completion_tokens" {
+            self.tokens_key.clone_from(&other.tokens_key);
+        }
+        self.drop_temperature |= other.drop_temperature;
+        self.drop_cache_hint |= other.drop_cache_hint;
+    }
+}
+
 /// Requested effort after applying `attempt.reasoning_cap`.
 pub fn capped_effort(requested: ReasoningEffort, attempt: &AttemptState) -> ReasoningEffort {
     match attempt.reasoning_cap {
         Some(cap) if requested > cap => cap,
         _ => requested,
+    }
+}
+
+/// Thinking-token budget after applying `attempt.reasoning_cap`. An explicit
+/// `budget_tokens` wins over the effort mapping, but a cap still lowers it,
+/// so a capped call (the agent's wrap-up turn) is cheaper on budget routes too.
+pub fn capped_budget(
+    explicit: Option<u64>,
+    requested: ReasoningEffort,
+    attempt: &AttemptState,
+) -> u64 {
+    match (explicit, attempt.reasoning_cap) {
+        (Some(b), Some(cap)) => b.min(cap.budget()),
+        (Some(b), None) => b,
+        (None, _) => capped_effort(requested, attempt).budget(),
     }
 }
 
@@ -162,6 +189,9 @@ pub struct HttpTransport {
     pub retries: u32,
     /// Pipeline role recorded on every ledger entry.
     pub role: String,
+    /// Client-local rejected-field adjustments confirmed by a usable success.
+    /// Reasoning drops and caps are never learned across requests.
+    learned: Mutex<AttemptState>,
 }
 
 impl HttpTransport {
@@ -182,6 +212,7 @@ impl HttpTransport {
             max_requests,
             retries,
             role: role.to_string(),
+            learned: Mutex::new(AttemptState::default()),
         })
     }
 
@@ -223,12 +254,27 @@ impl HttpTransport {
         messages: &[ChatMessage],
         tools: &[ToolSpec],
     ) -> Result<Completion, ProviderError> {
+        self.send_capped(adapter, messages, tools, None).await
+    }
+
+    /// `send` with the reasoning effort capped from the first attempt.
+    pub async fn send_capped<A: ProtocolAdapter>(
+        &self,
+        adapter: &A,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        cap: Option<ReasoningEffort>,
+    ) -> Result<Completion, ProviderError> {
         let tel = Telemetry {
             label: adapter.label(),
             model: adapter.model().to_string(),
             requested: adapter.requested_reasoning(),
         };
-        let mut attempt = AttemptState::default();
+        let mut attempt = AttemptState {
+            reasoning_cap: cap,
+            ..AttemptState::default()
+        };
+        let mut pending = AttemptState::default();
         let mut attempts = 0u32;
         let mut retries_used = 0u32;
         let start = Instant::now();
@@ -239,6 +285,8 @@ impl HttpTransport {
                 return Err(ProviderError::BudgetExhausted);
             }
             attempts += 1;
+            // Also pick up adjustments learned while this request was in flight.
+            attempt.merge_adjustments(&self.learned.lock().unwrap());
             let spec = match adapter.build(messages, tools, &mut attempt) {
                 Ok(s) => s,
                 Err(e) => {
@@ -323,6 +371,7 @@ impl HttpTransport {
                     };
                     match parsed {
                         Parse::Ok(message, usage) => {
+                            self.learned.lock().unwrap().merge_adjustments(&pending);
                             let latency = start.elapsed().as_millis() as u64;
                             self.record(
                                 &tel,
@@ -354,6 +403,9 @@ impl HttpTransport {
                             });
                         }
                         Parse::RetrySameSlot(reason) => {
+                            if status == 400 {
+                                pending.merge_adjustments(&attempt);
+                            }
                             self.record(
                                 &tel,
                                 &effective,
@@ -473,5 +525,56 @@ impl<A: ProtocolAdapter> super::ModelClient for HttpClient<A> {
         tools: &[ToolSpec],
     ) -> Result<Completion, ProviderError> {
         self.transport.send(&self.adapter, messages, tools).await
+    }
+
+    async fn complete_capped(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        cap: ReasoningEffort,
+    ) -> Result<Completion, ProviderError> {
+        self.transport
+            .send_capped(&self.adapter, messages, tools, Some(cap))
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn learned_adjustments_merge_without_weakening_or_copying_reasoning_or_retry_guards() {
+        let mut learned = AttemptState::default();
+        learned.merge_adjustments(&AttemptState {
+            tokens_key: "max_completion_tokens".into(),
+            drop_temperature: true,
+            drop_reasoning: true,
+            drop_cache_hint: true,
+            reasoning_cap: Some(ReasoningEffort::Low),
+            thinking_mode_retried: true,
+        });
+        learned.merge_adjustments(&AttemptState::default());
+        learned.merge_adjustments(&AttemptState {
+            reasoning_cap: Some(ReasoningEffort::High),
+            ..AttemptState::default()
+        });
+        assert_eq!(learned.tokens_key, "max_completion_tokens");
+        assert!(learned.drop_temperature);
+        assert!(!learned.drop_reasoning);
+        assert!(learned.drop_cache_hint);
+        assert_eq!(learned.reasoning_cap, None);
+        assert!(!learned.thinking_mode_retried);
+
+        let mut request = AttemptState {
+            drop_reasoning: true,
+            reasoning_cap: Some(ReasoningEffort::Low),
+            ..AttemptState::default()
+        };
+        request.merge_adjustments(&learned);
+        assert!(request.drop_reasoning);
+        assert_eq!(request.reasoning_cap, Some(ReasoningEffort::Low));
+        assert!(request.drop_temperature && request.drop_cache_hint);
+        assert_eq!(request.tokens_key, "max_completion_tokens");
     }
 }

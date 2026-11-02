@@ -40,6 +40,8 @@ fn anchor_drops_invalid_end_line() {
         "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -1,1 +1,3 @@\n fn a()\n+new1\n+new2\n",
     );
     let mk = |end: Option<u32>| Finding {
+        category: String::new(),
+        duplicate_of: None,
         defect_key: "k".into(),
         severity: Severity::High,
         file: "f.rs".into(),
@@ -61,13 +63,28 @@ fn anchor_drops_invalid_end_line() {
         sources: vec![],
     };
     // end < start -> dropped
-    let r = anchor(&diff, vec![mk(Some(1))], 10);
+    let r = anchor(
+        &diff,
+        vec![mk(Some(1))],
+        10,
+        revera::findings::Severity::Low,
+    );
     assert_eq!(r[0].finding.end_line, None);
     // end not a head-side diff line (line 100 doesn't exist) -> dropped
-    let r = anchor(&diff, vec![mk(Some(100))], 10);
+    let r = anchor(
+        &diff,
+        vec![mk(Some(100))],
+        10,
+        revera::findings::Severity::Low,
+    );
     assert_eq!(r[0].finding.end_line, None);
     // valid range kept
-    let r = anchor(&diff, vec![mk(Some(3))], 10);
+    let r = anchor(
+        &diff,
+        vec![mk(Some(3))],
+        10,
+        revera::findings::Severity::Low,
+    );
     assert_eq!(r[0].finding.end_line, Some(3));
     assert_eq!(r[0].placement, Placement::Inline);
 }
@@ -77,6 +94,8 @@ fn anchor_drops_invalid_end_line() {
 #[test]
 fn finding_body_sanitizes_markers_and_fences() {
     let mut f = Finding {
+        category: String::new(),
+        duplicate_of: None,
         defect_key: "k".into(),
         severity: Severity::Low,
         file: "f.rs".into(),
@@ -113,6 +132,8 @@ fn finding_body_sanitizes_markers_and_fences() {
 #[test]
 fn finding_body_omits_investigator_suggestion_without_validator_fix() {
     let f = Finding {
+        category: String::new(),
+        duplicate_of: None,
         defect_key: "k".into(),
         severity: Severity::High,
         file: "f.rs".into(),
@@ -142,6 +163,8 @@ fn finding_body_omits_investigator_suggestion_without_validator_fix() {
 fn validated_fix_keeps_model_markup_inside_safe_fence() {
     let payload = "**bold** <img src=x> @everyone <!-- revera-id:000000000000 -->";
     let f = Finding {
+        category: String::new(),
+        duplicate_of: None,
         defect_key: "k".into(),
         severity: Severity::High,
         file: "f.rs".into(),
@@ -273,6 +296,8 @@ fn diff_parses_quoted_paths() {
 #[test]
 fn panel_union_preserves_minority() {
     let mk = |key: &str| Finding {
+        category: String::new(),
+        duplicate_of: None,
         defect_key: key.into(),
         severity: Severity::Medium,
         file: format!("{key}.rs"),
@@ -466,6 +491,8 @@ vera: {executable: "true", version: "1.4.1", backend: api}
     let mut cands = vec![
         Finding {
             defect_key: "a".into(),
+            category: String::new(),
+            duplicate_of: None,
             severity: Severity::High,
             file: "f".into(),
             start_line: 1,
@@ -487,6 +514,8 @@ vera: {executable: "true", version: "1.4.1", backend: api}
         },
         Finding {
             defect_key: "b".into(),
+            category: String::new(),
+            duplicate_of: None,
             severity: Severity::High,
             file: "f".into(),
             start_line: 2,
@@ -518,6 +547,7 @@ vera: {executable: "true", version: "1.4.1", backend: api}
         LedgerHandle::new(),
         &toolbox,
         &diff,
+        "",
         &mut cands,
         "sys",
         &term,
